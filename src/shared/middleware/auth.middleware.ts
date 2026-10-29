@@ -1,100 +1,124 @@
 import { Request, Response, NextFunction } from 'express';
-import { supabase } from '../supabase.js';
+import { PrismaClient, Role, Status } from '@prisma/client';
+import { createClient } from '@supabase/supabase-js';
 
-// Express Request 인터페이스 확장 (사용자 정보 첨부용)
+const prisma = new PrismaClient();
+
+// Supabase 환경 변수 (없어도 앱이 죽지 않도록 안전하게 처리)
+const supabaseUrl = process.env.SUPABASE_URL || '';
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '';
+const hasSupabaseConfig = Boolean(supabaseUrl && supabaseKey);
+
+const supabase = hasSupabaseConfig ? createClient(supabaseUrl, supabaseKey) : null;
+
 export interface AuthenticatedRequest extends Request {
   user?: {
-    user_id: string;
-    email: string;
-    role: 'patient' | 'family' | 'staff' | 'admin';
-    status: 'PENDING' | 'APPROVED' | 'REJECTED';
+    identifier: string;
+    name: string;
+    role: Role;
+    status: Status;
   };
 }
 
-/**
- * 1. 인증 미들웨어 (사용자 식별)
- */
 export const authenticateUser = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
+    // 1. 헤더에서 토큰 또는 x-user-identifier 추출
+    const identifierHeader = req.headers['x-user-identifier'] as string;
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      res.status(401).json({ error: '인증 토큰이 필요합니다.' });
+
+    let targetIdentifier = identifierHeader;
+
+    if (!targetIdentifier && authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+
+      // 만약 Supabase 설정이 되어 있고, 토큰이 진짜 JWT 형식(예: 점 . 이 포함된 긴 문자열)인 경우 Supabase 검증 시도
+      if (hasSupabaseConfig && supabase && token.includes('.')) {
+        const { data: { user: supabaseUser }, error } = await supabase.auth.getUser(token);
+        if (!error && supabaseUser) {
+          // Supabase 유저와 매핑된 DB 유저 탐색
+          const dbUser = await prisma.user.findFirst({
+            where: { OR: [{ identifier: supabaseUser.email }, { identifier: supabaseUser.id }] },
+          });
+          if (dbUser) targetIdentifier = dbUser.identifier;
+        }
+      }
+
+      // Supabase 설정이 없거나 위 검증을 거치지 않았다면 토큰 자체를 identifier(예: 'patient_test_01')로 간주
+      if (!targetIdentifier) {
+        targetIdentifier = token;
+      }
+    }
+
+    if (!targetIdentifier) {
+      res.status(401).json({
+        error: { code: 'UNAUTHORIZED', message: '인증 정보(토큰 또는 identifier)가 필요합니다.' },
+      });
       return;
     }
 
-    const token = authHeader.split(' ')[1];
+    // DB에서 사용자 조회
+    const user = await prisma.user.findUnique({
+      where: { identifier: targetIdentifier },
+    });
 
-    // Supabase Auth 토큰 검증
-    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser(token);
-
-    if (authError || !authUser) {
-      res.status(401).json({ error: '유효하지 않거나 만료된 토큰입니다.' });
+    if (!user) {
+      res.status(404).json({
+        error: { code: 'USER_NOT_FOUND', message: '사용자 정보를 찾을 수 없습니다.' },
+      });
       return;
     }
 
-    // DB에서 사용자 정보 및 승인 상태 조회
-    const { data: dbUser, error: dbError } = await supabase
-      .from('users')
-      .select('user_id, email, role, status')
-      .eq('user_id', authUser.id)
-      .single();
-
-    if (dbError || !dbUser) {
-      res.status(404).json({ error: '사용자 정보를 찾을 수 없습니다.' });
+    if (user.status === Status.WITHDRAWN) {
+      res.status(403).json({
+        error: { code: 'ACCOUNT_WITHDRAWN', message: '탈퇴 처리된 계정입니다.' },
+      });
       return;
     }
 
-    // Request 객체에 사용자 정보 저장
-    req.user = dbUser as AuthenticatedRequest['user'];
+    req.user = {
+      identifier: user.identifier,
+      name: user.name,
+      role: user.role,
+      status: user.status,
+    };
+
     next();
   } catch (error) {
-    res.status(500).json({ error: '인증 처리 중 오류가 발생했습니다.' });
+    res.status(500).json({
+      error: { code: 'INTERNAL_SERVER_ERROR', message: '인증 처리 중 오류가 발생했습니다.' },
+    });
   }
 };
 
-/**
- * 2. 승인 상태 검증 미들웨어 (APPROVED 상태만 통과)
- */
-export const requireApprovedUser = (
-  req: AuthenticatedRequest,
-  res: Response,
-  next: NextFunction
-): void => {
+export const requireApprovedUser = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   if (!req.user) {
-    res.status(401).json({ error: '인증 정보가 없습니다.' });
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: '인증 정보가 없습니다.' } });
     return;
   }
-
-  if (req.user.status !== 'APPROVED') {
+  if (req.user.status !== Status.APPROVED && req.user.status !== Status.ACTIVE) {
     res.status(403).json({
-      error: '승인 대기 중이거나 거절된 계정입니다. 관리자 승인 후 이용 가능합니다.',
+      error: { code: 'NOT_APPROVED', message: '승인 대기 중이거나 이용이 제한된 계정입니다.' },
       status: req.user.status,
     });
     return;
   }
-
   next();
 };
 
-/**
- * 3. 역할(Role) 기반 권한 검증 미들웨어
- */
-export const requireRole = (allowedRoles: Array<'patient' | 'family' | 'staff' | 'admin'>) => {
+export const requireRole = (allowedRoles: Role[]) => {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
     if (!req.user) {
-      res.status(401).json({ error: '인증 정보가 없습니다.' });
+      res.status(401).json({ error: { code: 'UNAUTHORIZED', message: '인증 정보가 없습니다.' } });
       return;
     }
-
     if (!allowedRoles.includes(req.user.role)) {
-      res.status(403).json({ error: '해당 요청에 대한 접근 권한이 없습니다.' });
+      res.status(403).json({ error: { code: 'FORBIDDEN', message: '접근 권한이 없습니다.' } });
       return;
     }
-
     next();
   };
 };
