@@ -1,0 +1,23 @@
+openapi: 3.1.0
+info:
+  title: CareGap bootstrap API
+  version: 0.1.0
+  description: Business contracts are proposals in contracts.md. Only health is implemented here.
+paths:
+  /health:
+    get:
+      responses:
+        '200':
+          description: Process is alive; database readiness is not checked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [status]
+                    properties:
+                      status:
+                        const: ok

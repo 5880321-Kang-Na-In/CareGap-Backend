@@ -1,0 +1,1 @@
+SQL migrations: NNNN_beN_description.sql. Applied files are immutable. Common schema requires BE1 and affected domain review. No business schema is pre-created. Runner permits only loopback caregap_local.
